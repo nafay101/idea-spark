@@ -8,7 +8,7 @@ from google.genai import errors, types
 # ----------------------------------------------------------------------------
 # Page setup
 # ----------------------------------------------------------------------------
-st.set_page_config(page_title="Gemini Flash Studio", page_icon="✨", layout="wide")
+st.set_page_config(page_title="Idea Spark AI", page_icon="✨", layout="wide")
 
 # Models are tried in this order. If one is unavailable (404), rate-limited (429)
 # or overloaded (503), the app moves on to the next one.
@@ -59,72 +59,110 @@ TASKS = {
 # ----------------------------------------------------------------------------
 # Light, colorful styling
 # ----------------------------------------------------------------------------
-st.markdown(
-    """
+# Cute background doodles (inline SVG, no image files needed)
+DOODLE_SVG = """<svg xmlns='http://www.w3.org/2000/svg' width='440' height='440' viewBox='0 0 440 440' fill='none' stroke-linecap='round' stroke-linejoin='round'>
+<g stroke='%23B9ABF7' stroke-width='2.5' opacity='.55'>
+<path d='M50 50 q8 -18 16 0 q8 18 16 0 q8 -18 16 0'/>
+<circle cx='330' cy='70' r='14' stroke-dasharray='4 7'/>
+<path d='M205 125 v22 M194 136 h22'/>
+<path d='M60 380 q10 -14 20 0 q10 14 20 0'/>
+</g>
+<g stroke='%23F6A6D2' stroke-width='2.5' opacity='.6'>
+<path transform='translate(360 270) scale(.7)' d='M0 -4 C-14 -22 -34 -2 0 24 C34 -2 14 -22 0 -4z'/>
+<path d='M150 250 l5 -11 l5 11 l11 5 l-11 5 l-5 11 l-5 -11 l-11 -5z'/>
+<path d='M300 380 l3 -7 l3 7 l7 3 l-7 3 l-3 7 l-3 -7 l-7 -3z'/>
+</g>
+<g stroke='%23FFBE94' stroke-width='2.5' opacity='.65'>
+<circle cx='95' cy='200' r='15'/>
+<path d='M88 218 h14 M90 225 h10'/>
+<path d='M95 170 v-8 M72 178 l-6 -5 M118 178 l6 -5'/>
+<path d='M250 40 q10 -10 20 0 q10 10 20 0'/>
+</g>
+<g stroke='%239ADBC5' stroke-width='2.5' opacity='.65'>
+<path d='M380 150 l4 -9 l4 9 l9 4 l-9 4 l-4 9 l-4 -9 l-9 -4z'/>
+<circle cx='230' cy='330' r='7'/>
+<path d='M390 390 v16 M382 398 h16'/>
+</g>
+<g fill='%23D9CFFF' opacity='.7'><circle cx='180' cy='60' r='4'/><circle cx='20' cy='290' r='4'/><circle cx='420' cy='330' r='4'/></g>
+<g fill='%23FFD3E8' opacity='.8'><circle cx='320' cy='190' r='4'/><circle cx='120' cy='120' r='4'/></g>
+</svg>"""
+DOODLE_URI = 'url("data:image/svg+xml;utf8,' + DOODLE_SVG.replace("\n", "") + '")'
+
+CSS = """
 <style>
-.stApp { background: linear-gradient(135deg, #F3F0FF 0%, #FFF0F7 100%); }
+.stApp {
+    background-image: __DOODLE__, linear-gradient(135deg, #F4EFFF 0%, #FFF1F8 55%, #FFF5EC 100%);
+    background-size: 440px 440px, cover;
+    background-repeat: repeat, no-repeat;
+    background-attachment: fixed, fixed;
+}
 .stApp, .stApp p, .stApp li, .stApp label, .stApp span, .stApp div,
-.stApp h1, .stApp h2, .stApp h3, .stApp h4 { color: #1F2937; }
-[data-testid="stSidebar"] { background: #FFFFFF; border-right: 1px solid #E8E4FF; }
-[data-testid="stSidebar"] * { color: #1F2937; }
+.stApp h2, .stApp h3, .stApp h4 { color: #2D2A4A; }
+[data-testid="stSidebar"] { background: linear-gradient(180deg, rgba(244,239,255,.95), rgba(255,240,248,.95)); border-right: 1px solid #E6DEFF; }
+[data-testid="stSidebar"] > div { background: transparent; }
+[data-testid="stSidebar"] * { color: #2D2A4A; }
 [data-testid="stHeader"] { background: transparent; }
 
 .hero { padding: 6px 0 14px 0; }
-.hero h1 { font-size: 2.2rem; margin: 0; color: #4B3FD1 !important; }
-.hero p { margin: 4px 0 0 0; color: #6B7280 !important; }
+.hero h1 { font-size: 2.4rem; margin: 0; background: linear-gradient(90deg, #7C6AF0, #E879B9);
+    -webkit-background-clip: text; background-clip: text; color: transparent !important;
+    -webkit-text-fill-color: transparent; }
+.hero p { margin: 4px 0 0 0; color: #6B6890 !important; }
 
-/* Tabs */
-button[data-baseweb="tab"] { background: transparent; font-weight: 600; color: #6B7280 !important; }
-button[data-baseweb="tab"][aria-selected="true"] { color: #6C63FF !important; }
+button[data-baseweb="tab"] { background: transparent; font-weight: 600; color: #7A7699 !important; }
+button[data-baseweb="tab"][aria-selected="true"] { color: #7C6AF0 !important; }
 
-/* Cards / bubbles */
 [data-testid="stChatMessage"] {
-    background: #FFFFFF; border: 1px solid #ECE8FF; border-radius: 16px;
-    padding: 12px 16px; box-shadow: 0 2px 10px rgba(108, 99, 255, 0.07);
+    background: rgba(255,255,255,.82); border: 1px solid #EADFFF; border-radius: 18px;
+    padding: 12px 16px; box-shadow: 0 4px 14px rgba(139, 124, 246, 0.08);
 }
-.card { background: #FFFFFF; border: 1px solid #ECE8FF; border-radius: 16px;
-        padding: 18px; box-shadow: 0 2px 10px rgba(108, 99, 255, 0.07); }
+.card { background: rgba(255,255,255,.82); border: 1px solid #EADFFF; border-radius: 18px;
+        padding: 18px; box-shadow: 0 4px 14px rgba(139, 124, 246, 0.08); }
 
-/* Inputs */
 .stTextArea textarea, .stTextInput input {
-    background: #FFFFFF !important; color: #1F2937 !important;
-    border: 1px solid #D9D4FF !important; border-radius: 12px !important;
+    background: rgba(255,255,255,.85) !important; color: #2D2A4A !important;
+    border: 1px solid #DDD3FF !important; border-radius: 14px !important;
 }
-div[data-baseweb="select"] > div { background: #FFFFFF !important; border-radius: 12px !important; }
-div[data-baseweb="select"] * { color: #1F2937 !important; }
+div[data-baseweb="select"] > div { background: rgba(255,255,255,.85) !important; border-radius: 14px !important; border-color: #DDD3FF !important; }
+div[data-baseweb="select"] * { color: #2D2A4A !important; }
 ul[role="listbox"], div[data-baseweb="popover"] > div { background: #FFFFFF !important; }
-ul[role="listbox"] li { color: #1F2937 !important; }
-ul[role="listbox"] li:hover { background: #EEEAFF !important; }
-[data-testid="stChatInput"], [data-testid="stChatInput"] > div,
-[data-testid="stBottom"], [data-testid="stBottom"] > div { background: #FFFFFF !important; }
-[data-testid="stChatInput"] textarea { color: #1F2937 !important; }
-[data-testid="stFileUploaderDropzone"] { background: #FAF9FF; border: 2px dashed #C9C2FF; border-radius: 14px; }
-[data-testid="stFileUploaderDropzone"] * { color: #1F2937 !important; }
+ul[role="listbox"] li { color: #2D2A4A !important; }
+ul[role="listbox"] li:hover { background: #F1ECFF !important; }
 
-/* Buttons */
+/* Chat bar: soft glass instead of a big white strip */
+[data-testid="stBottom"], [data-testid="stBottom"] > div,
+[data-testid="stBottomBlockContainer"] { background: transparent !important; }
+[data-testid="stChatInput"] { background: rgba(255,255,255,.78) !important; border: 1px solid #DDD3FF !important;
+    border-radius: 20px !important; box-shadow: 0 6px 20px rgba(139,124,246,.14); }
+[data-testid="stChatInput"] > div, [data-testid="stChatInput"] textarea { background: transparent !important; color: #2D2A4A !important; }
+[data-testid="stChatInput"] button { background: linear-gradient(135deg, #8B7CF6, #F08CC8) !important; border-radius: 12px; }
+[data-testid="stChatInput"] button svg { fill: #FFFFFF !important; color: #FFFFFF !important; }
+
+[data-testid="stFileUploaderDropzone"] { background: rgba(255,255,255,.7); border: 2px dashed #CFC4FF; border-radius: 16px; }
+[data-testid="stFileUploaderDropzone"] * { color: #2D2A4A !important; }
+
 .stButton > button, [data-testid="stFileUploaderDropzone"] button {
-    background: linear-gradient(90deg, #6C63FF, #A855F7); color: #FFFFFF !important;
-    border: none; border-radius: 12px; padding: 0.55rem 1.3rem; font-weight: 600;
+    background: linear-gradient(90deg, #8B7CF6, #F08CC8); color: #FFFFFF !important;
+    border: none; border-radius: 14px; padding: 0.55rem 1.3rem; font-weight: 600;
+    box-shadow: 0 4px 12px rgba(139,124,246,.25);
 }
-.stButton > button:hover { filter: brightness(1.08); }
+.stButton > button:hover { filter: brightness(1.06); }
 .stButton > button p, [data-testid="stFileUploaderDropzone"] button * { color: #FFFFFF !important; }
 
-/* Thinking pill */
 .thinking { display: inline-flex; align-items: center; gap: 10px; padding: 8px 16px;
-    background: #F3F1FF; border: 1px solid #D9D4FF; border-radius: 999px;
-    color: #4B3FD1; font-weight: 600; animation: glow 1.8s ease-in-out infinite; }
-.thinking .dot { width: 8px; height: 8px; border-radius: 50%; background: #6C63FF;
+    background: rgba(255,255,255,.85); border: 1px solid #DDD3FF; border-radius: 999px;
+    color: #7C6AF0; font-weight: 600; animation: glow 1.8s ease-in-out infinite; }
+.thinking .dot { width: 8px; height: 8px; border-radius: 50%; background: #8B7CF6;
     animation: bounce 1.2s infinite ease-in-out; }
-.thinking .dot:nth-child(2) { animation-delay: 0.15s; }
-.thinking .dot:nth-child(3) { animation-delay: 0.3s; }
+.thinking .dot:nth-child(2) { animation-delay: 0.15s; background: #F08CC8; }
+.thinking .dot:nth-child(3) { animation-delay: 0.3s; background: #FFB27D; }
 @keyframes bounce { 0%, 80%, 100% { transform: translateY(0); opacity: .5; }
                     40% { transform: translateY(-6px); opacity: 1; } }
-@keyframes glow { 0%, 100% { box-shadow: 0 0 0 0 rgba(108,99,255,0.25); }
-                  50% { box-shadow: 0 0 0 8px rgba(108,99,255,0); } }
+@keyframes glow { 0%, 100% { box-shadow: 0 0 0 0 rgba(139,124,246,0.25); }
+                  50% { box-shadow: 0 0 0 8px rgba(139,124,246,0); } }
 </style>
-""",
-    unsafe_allow_html=True,
-)
+"""
+st.markdown(CSS.replace("__DOODLE__", DOODLE_URI), unsafe_allow_html=True)
 
 
 def pill(text: str) -> str:
@@ -277,8 +315,8 @@ model_list = [first] + [m for m in MODELS if m != first]
 # Header
 # ----------------------------------------------------------------------------
 st.markdown(
-    '<div class="hero"><h1>✨ Gemini Flash Studio</h1>'
-    "<p>Chat with AI or use handy writing tools, powered by Gemini Flash.</p></div>",
+    '<div class="hero"><h1>✨ Idea Spark AI</h1>'
+    "<p>Spark new ideas, chat with AI and use handy writing tools, powered by Gemini Flash.</p></div>",
     unsafe_allow_html=True,
 )
 
