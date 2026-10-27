@@ -22,6 +22,10 @@ MODELS = [
 
 MAX_FILE_MB = 15
 
+# Speed setting -> how long the model "thinks" before answering
+SPEEDS = {"⚡ Fast": "low", "⚖️ Balanced": "medium", "🧠 Deep thinking": "high"}
+MAX_HISTORY = 20  # only the last 20 chat messages are sent, which keeps replies quick
+
 # ----------------------------------------------------------------------------
 # Writing tools: name shown in the dropdown -> instruction sent to the AI
 # Add your own by adding one more line.
@@ -179,9 +183,16 @@ class FriendlyError(Exception):
     """An error whose message is safe to show to the user."""
 
 
-def stream_gemini(client, contents, temperature, model_list, system=None):
+def make_config(temperature, system, thinking):
+    kwargs = dict(temperature=temperature, system_instruction=system)
+    if thinking:
+        kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=thinking)
+    return types.GenerateContentConfig(**kwargs)
+
+
+def stream_gemini(client, contents, temperature, model_list, system=None, thinking="low"):
     """Yield text chunks. Retries busy servers and falls back to other models."""
-    config = types.GenerateContentConfig(temperature=temperature, system_instruction=system)
+    config = make_config(temperature, system, thinking)
     problems = set()
 
     for model in model_list:
@@ -199,6 +210,10 @@ def stream_gemini(client, contents, temperature, model_list, system=None):
                 if got_text:
                     raise FriendlyError("The answer was cut off. Please try again.")
                 code = getattr(e, "code", None)
+                if code == 400 and "thinking" in str(e).lower() and config.thinking_config:
+                    # This model does not accept that speed setting: retry without it.
+                    config = make_config(temperature, system, None)
+                    continue
                 if code in (400, 401, 403):
                     msg = str(e).lower()
                     if "api key" in msg or code in (401, 403):
@@ -212,7 +227,7 @@ def stream_gemini(client, contents, temperature, model_list, system=None):
                     break  # quotas are per model, try next one
                 if code in (500, 502, 503, 504):
                     problems.add("busy")
-                    time.sleep(2 ** attempt)
+                    time.sleep(1 + attempt)
                     continue  # retry same model
                 raise FriendlyError(f"Unexpected error from Google: {e}")
 
@@ -226,14 +241,14 @@ def stream_gemini(client, contents, temperature, model_list, system=None):
     )
 
 
-def run_stream(client, contents, temperature, model_list, thinking_text, system=None):
+def run_stream(client, contents, temperature, model_list, thinking_text, system=None, thinking="low"):
     """Show the thinking pill, stream the answer, return the final text (or None on error)."""
     pill_box = st.empty()
     out_box = st.empty()
     pill_box.markdown(pill(thinking_text), unsafe_allow_html=True)
     text = ""
     try:
-        for piece in stream_gemini(client, contents, temperature, model_list, system):
+        for piece in stream_gemini(client, contents, temperature, model_list, system, thinking):
             pill_box.empty()
             text += piece
             out_box.markdown(text + "▌")
@@ -300,6 +315,12 @@ with st.sidebar:
     custom_model = st.text_input("Custom model name (optional)",
                                  placeholder="e.g. gemini-3.6-flash")
     temperature = st.slider("Creativity", 0.0, 2.0, 1.0, 0.1)
+    speed = st.selectbox(
+        "Speed",
+        list(SPEEDS.keys()),
+        help="Fast answers quickly. Deep thinking is slower but better for hard questions.",
+    )
+    thinking_level = SPEEDS[speed]
 
     if st.button("🗑️ Clear chat"):
         st.session_state.messages = []
@@ -323,7 +344,12 @@ st.markdown(
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-client = genai.Client(api_key=api_key) if api_key else None
+@st.cache_resource
+def get_client(key):
+    return genai.Client(api_key=key)
+
+
+client = get_client(api_key) if api_key else None
 tab_chat, tab_tools = st.tabs(["💬 Chat", "🛠️ Writing Tools"])
 
 # ----------------------------------------------------------------------------
@@ -348,10 +374,11 @@ with tab_chat:
                     role="user" if m["role"] == "user" else "model",
                     parts=[types.Part.from_text(text=m["content"])],
                 )
-                for m in st.session_state.messages
+                for m in st.session_state.messages[-MAX_HISTORY:]
             ]
             with st.chat_message("assistant"):
-                reply = run_stream(client, history, temperature, model_list, "✨ Gemini is thinking")
+                reply = run_stream(client, history, temperature, model_list, "✨ Gemini is thinking",
+                                   thinking=thinking_level)
             if reply:
                 st.session_state.messages.append({"role": "assistant", "content": reply})
             else:
@@ -415,5 +442,6 @@ with tab_tools:
                 run_stream(
                     client, contents, temperature, model_list, "✨ Crafting your result",
                     system="Follow the task exactly. Output only the result, formatted in clean Markdown.",
+                    thinking=thinking_level,
                 )
                 st.markdown("</div>", unsafe_allow_html=True)
