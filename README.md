@@ -1,4 +1,4 @@
-# ✨ Gemini Flash Studio
+# ✨ Idea Spark AI
 
 A light, colorful AI assistant built with **Streamlit** and **Google Gemini Flash**.
 
