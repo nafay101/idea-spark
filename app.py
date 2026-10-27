@@ -24,6 +24,11 @@ MAX_FILE_MB = 15
 
 # Speed setting -> how long the model "thinks" before answering
 SPEEDS = {"⚡ Fast": "low", "⚖️ Balanced": "medium", "🧠 Deep thinking": "high"}
+CHAT_SYSTEM = (
+    "You are Spark, the friendly AI assistant inside the Idea Spark AI app. "
+    "If someone asks your name, say you are Spark. If asked which model powers you, "
+    "say Google Gemini. Be helpful, warm and clear."
+)
 MAX_HISTORY = 20  # only the last 20 chat messages are sent, which keeps replies quick
 
 # ----------------------------------------------------------------------------
@@ -182,6 +187,10 @@ def pill(text: str) -> str:
 class FriendlyError(Exception):
     """An error whose message is safe to show to the user."""
 
+    def __init__(self, message, detail=""):
+        super().__init__(message)
+        self.detail = detail
+
 
 def make_config(temperature, system, thinking):
     kwargs = dict(temperature=temperature, system_instruction=system)
@@ -190,65 +199,96 @@ def make_config(temperature, system, thinking):
     return types.GenerateContentConfig(**kwargs)
 
 
-def stream_gemini(client, contents, temperature, model_list, system=None, thinking="low"):
-    """Yield text chunks. Retries busy servers and falls back to other models."""
+ROUNDS = 5  # how many times all models are tried before giving up
+
+
+def stream_gemini(client, contents, temperature, model_list, system=None,
+                  thinking="low", on_wait=None):
+    """Yield text chunks without bothering the user.
+
+    Busy or rate-limited? Jump to the next model right away. If every model is
+    busy, wait a little (longer each round) and go around again.
+    """
     config = make_config(temperature, system, thinking)
-    problems = set()
+    dead = set()  # models that do not exist (404) are skipped for this request
+    last_detail = ""
+    final_problems = set()
 
-    for model in model_list:
-        for attempt in range(3):
-            got_text = False
-            try:
-                for chunk in client.models.generate_content_stream(
-                    model=model, contents=contents, config=config
-                ):
-                    if chunk.text:
-                        got_text = True
-                        yield chunk.text
-                return
-            except errors.APIError as e:
-                if got_text:
-                    raise FriendlyError("The answer was cut off. Please try again.")
-                code = getattr(e, "code", None)
-                if code == 400 and "thinking" in str(e).lower() and config.thinking_config:
-                    # This model does not accept that speed setting: retry without it.
-                    config = make_config(temperature, system, None)
-                    continue
-                if code in (400, 401, 403):
-                    msg = str(e).lower()
-                    if "api key" in msg or code in (401, 403):
-                        raise FriendlyError("Your API key was rejected. Please check it in the sidebar.")
-                    raise FriendlyError(f"Google could not process this request: {e}")
-                if code == 404:
-                    problems.add("missing")
-                    break  # try next model
-                if code == 429:
-                    problems.add("limit")
-                    break  # quotas are per model, try next one
-                if code in (500, 502, 503, 504):
-                    problems.add("busy")
-                    time.sleep(1 + attempt)
-                    continue  # retry same model
-                raise FriendlyError(f"Unexpected error from Google: {e}")
+    for round_no in range(ROUNDS):
+        live = [m for m in model_list if m not in dead]
+        if not live:
+            break
+        problems = set()
 
-    if "limit" in problems:
-        raise FriendlyError("Free-tier limit reached. Please wait about 20 seconds and try again.")
-    if "busy" in problems:
-        raise FriendlyError("Google's servers are very busy. Please try again in a few seconds.")
+        for model in live:
+            for _ in range(2):  # 2nd pass only if we must drop the speed setting
+                got_text = False
+                try:
+                    for chunk in client.models.generate_content_stream(
+                        model=model, contents=contents, config=config
+                    ):
+                        if chunk.text:
+                            got_text = True
+                            yield chunk.text
+                    return
+                except errors.APIError as e:
+                    code = getattr(e, "code", None)
+                    last_detail = f"{model} -> {code}: {str(e)[:300]}"
+                    if got_text:
+                        raise FriendlyError("The answer was cut off. Please try again.", last_detail)
+                    if code == 400 and "thinking" in str(e).lower() and config.thinking_config:
+                        config = make_config(temperature, system, None)
+                        continue  # same model, without the speed setting
+                    if code in (400, 401, 403):
+                        if code in (401, 403) or "api key" in str(e).lower():
+                            raise FriendlyError("Your API key was rejected. Please check it in the sidebar.", last_detail)
+                        raise FriendlyError("Google could not process this request.", last_detail)
+                    if code == 404:
+                        dead.add(model)
+                    elif code == 429:
+                        problems.add("limit")
+                    elif code in (500, 502, 503, 504):
+                        problems.add("busy")
+                    else:
+                        raise FriendlyError("Unexpected error from Google.", last_detail)
+                    break  # next model
+
+        final_problems = problems
+        if not problems or round_no == ROUNDS - 1:
+            break
+        if problems == {"limit"}:
+            wait, msg = 5 * (round_no + 1), "⏳ Free-tier limit reached, waiting a moment"
+        else:
+            wait, msg = 2 * (round_no + 1), "🔄 Google is busy, trying again"
+        if on_wait:
+            on_wait(msg)
+        time.sleep(wait)
+
+    if "limit" in final_problems:
+        raise FriendlyError("Free-tier limit reached. Please wait about a minute and send again.", last_detail)
+    if "busy" in final_problems:
+        raise FriendlyError("Google's servers are still busy. Please send your message again in a moment.", last_detail)
     raise FriendlyError(
         "None of the models were available. Type a current model name in the sidebar "
-        "(see ai.google.dev/gemini-api/docs/models)."
+        "(see ai.google.dev/gemini-api/docs/models).", last_detail,
     )
 
 
-def run_stream(client, contents, temperature, model_list, thinking_text, system=None, thinking="low"):
+def run_stream(client, contents, temperature, model_list, thinking_text,
+               system=None, thinking="low"):
     """Show the thinking pill, stream the answer, return the final text (or None on error)."""
     pill_box = st.empty()
     out_box = st.empty()
+    detail_box = st.empty()
     pill_box.markdown(pill(thinking_text), unsafe_allow_html=True)
+
+    def on_wait(msg):
+        pill_box.markdown(pill(msg), unsafe_allow_html=True)
+
     text = ""
     try:
-        for piece in stream_gemini(client, contents, temperature, model_list, system, thinking):
+        for piece in stream_gemini(client, contents, temperature, model_list,
+                                   system, thinking, on_wait):
             pill_box.empty()
             text += piece
             out_box.markdown(text + "▌")
@@ -258,6 +298,9 @@ def run_stream(client, contents, temperature, model_list, thinking_text, system=
     except FriendlyError as e:
         pill_box.empty()
         out_box.warning(str(e))
+        if e.detail:
+            with detail_box.expander("Technical details"):
+                st.code(e.detail)
         return None
     except Exception as e:  # last-resort safety net
         pill_box.empty()
@@ -356,33 +399,37 @@ tab_chat, tab_tools = st.tabs(["💬 Chat", "🛠️ Writing Tools"])
 # Chat tab
 # ----------------------------------------------------------------------------
 with tab_chat:
-    for m in st.session_state.messages:
-        with st.chat_message(m["role"]):
-            st.markdown(m["content"])
-
+    chat_area = st.container()  # messages live here, above the input box
     prompt = st.chat_input("Ask me anything...")
-    if prompt:
-        if not client:
-            st.info("🔑 Add your Gemini API key in the sidebar to start.")
-        else:
-            st.session_state.messages.append({"role": "user", "content": prompt})
-            with st.chat_message("user"):
-                st.markdown(prompt)
 
-            history = [
-                types.Content(
-                    role="user" if m["role"] == "user" else "model",
-                    parts=[types.Part.from_text(text=m["content"])],
-                )
-                for m in st.session_state.messages[-MAX_HISTORY:]
-            ]
-            with st.chat_message("assistant"):
-                reply = run_stream(client, history, temperature, model_list, "✨ Gemini is thinking",
-                                   thinking=thinking_level)
-            if reply:
-                st.session_state.messages.append({"role": "assistant", "content": reply})
+    with chat_area:
+        for m in st.session_state.messages:
+            with st.chat_message(m["role"]):
+                st.markdown(m["content"])
+
+        if prompt:
+            if not client:
+                st.info("🔑 Add your Gemini API key in the sidebar to start.")
             else:
-                st.session_state.messages.pop()  # drop the unanswered question
+                st.session_state.messages.append({"role": "user", "content": prompt})
+                with st.chat_message("user"):
+                    st.markdown(prompt)
+
+                history = [
+                    types.Content(
+                        role="user" if m["role"] == "user" else "model",
+                        parts=[types.Part.from_text(text=m["content"])],
+                    )
+                    for m in st.session_state.messages[-MAX_HISTORY:]
+                ]
+                with st.chat_message("assistant"):
+                    reply = run_stream(client, history, temperature, model_list,
+                                       "✨ Spark is thinking", system=CHAT_SYSTEM,
+                                       thinking=thinking_level)
+                if reply:
+                    st.session_state.messages.append({"role": "assistant", "content": reply})
+                else:
+                    st.session_state.messages.pop()  # drop the unanswered question
 
 # ----------------------------------------------------------------------------
 # Writing tools tab
