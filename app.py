@@ -1,6 +1,9 @@
 import io
+import json
 import time
 
+import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 from google import genai
 from google.genai import errors, types
@@ -169,6 +172,21 @@ ul[role="listbox"] li:hover { background: #F1ECFF !important; }
                     40% { transform: translateY(-6px); opacity: 1; } }
 @keyframes glow { 0%, 100% { box-shadow: 0 0 0 0 rgba(139,124,246,0.25); }
                   50% { box-shadow: 0 0 0 8px rgba(139,124,246,0); } }
+
+/* Always light: no black/dark parts, whatever the browser or system theme is */
+:root, html, body, .stApp { color-scheme: light !important; }
+[data-testid="stMainMenuPopover"], [data-testid="stMainMenuList"],
+[data-testid="stMainMenuPopover"] * { background: #FFFFFF !important; color: #2D2A4A !important; }
+[data-testid="stToolbar"] *, [data-testid="stHeader"] button { color: #2D2A4A !important; }
+[data-testid="stTooltipContent"] { background: #FFFFFF !important; color: #2D2A4A !important; }
+[data-testid="stCode"] pre { background: #F4F0FF !important; }
+[data-testid="stCode"] code, [data-testid="stCode"] code span { color: #2D2A4A !important; }
+[data-testid="stExpander"] { background: rgba(255,255,255,.7); border: 1px solid #EADFFF; border-radius: 14px; }
+[data-testid="stExpander"] summary, [data-testid="stExpander"] summary * { color: #2D2A4A !important; }
+[data-testid="stDataFrame"] { border: 1px solid #EADFFF; border-radius: 12px; overflow: hidden; }
+.stDownloadButton > button { background: #FFFFFF; color: #7C6AF0 !important; border: 1px solid #DDD3FF;
+    border-radius: 14px; font-weight: 600; }
+.stDownloadButton > button p { color: #7C6AF0 !important; }
 </style>
 """
 st.markdown(CSS.replace("__DOODLE__", DOODLE_URI), unsafe_allow_html=True)
@@ -192,8 +210,10 @@ class FriendlyError(Exception):
         self.detail = detail
 
 
-def make_config(temperature, system, thinking):
+def make_config(temperature, system, thinking, json_mode=False):
     kwargs = dict(temperature=temperature, system_instruction=system)
+    if json_mode:
+        kwargs["response_mime_type"] = "application/json"
     if thinking:
         kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=thinking)
     return types.GenerateContentConfig(**kwargs)
@@ -203,13 +223,13 @@ ROUNDS = 5  # how many times all models are tried before giving up
 
 
 def stream_gemini(client, contents, temperature, model_list, system=None,
-                  thinking="low", on_wait=None):
+                  thinking="low", on_wait=None, json_mode=False):
     """Yield text chunks without bothering the user.
 
     Busy or rate-limited? Jump to the next model right away. If every model is
     busy, wait a little (longer each round) and go around again.
     """
-    config = make_config(temperature, system, thinking)
+    config = make_config(temperature, system, thinking, json_mode)
     dead = set()  # models that do not exist (404) are skipped for this request
     last_detail = ""
     final_problems = set()
@@ -237,7 +257,7 @@ def stream_gemini(client, contents, temperature, model_list, system=None,
                     if got_text:
                         raise FriendlyError("The answer was cut off. Please try again.", last_detail)
                     if code == 400 and "thinking" in str(e).lower() and config.thinking_config:
-                        config = make_config(temperature, system, None)
+                        config = make_config(temperature, system, None, json_mode)
                         continue  # same model, without the speed setting
                     if code in (400, 401, 403):
                         if code in (401, 403) or "api key" in str(e).lower():
@@ -340,6 +360,165 @@ def read_upload(uploaded):
 
 
 # ----------------------------------------------------------------------------
+# Graph helpers
+# ----------------------------------------------------------------------------
+CHART_TYPES = {
+    "✨ Auto (AI chooses)": None,
+    "📊 Bar": "bar",
+    "📏 Horizontal bar": "horizontal_bar",
+    "📈 Line": "line",
+    "🏔️ Area": "area",
+    "🥧 Pie": "pie",
+    "🔵 Scatter": "scatter",
+    "📶 Histogram": "histogram",
+}
+VALID_KINDS = {"bar", "horizontal_bar", "line", "area", "pie", "scatter", "histogram"}
+PALETTE = ["#8B7CF6", "#F08CC8", "#FFB27D", "#7DD3B0", "#6CB4F5", "#F5D76E"]
+
+GRAPH_SYSTEM = """You turn ideas, notes, text and tables into chart data.
+Reply with ONLY one valid JSON object (no markdown, no explanation) with these keys:
+{"title": str, "chart_type": "bar"|"horizontal_bar"|"line"|"area"|"pie"|"scatter"|"histogram",
+ "x_label": str, "y_label": str, "categories": [labels or x numbers],
+ "series": [{"name": str, "values": [numbers]}], "summary": "1-2 sentence takeaway",
+ "estimated": true|false}
+Rules: at most 30 categories and 5 series. Every series must have exactly as many values as
+categories (for a histogram, categories can be empty and the values are the raw numbers).
+Values must be plain numbers (no units, no % signs). Pick the chart type that fits the data best
+unless one is requested. If the user gives no numbers, create reasonable illustrative estimates
+and set estimated to true. Otherwise use the given numbers exactly and set estimated to false."""
+
+
+def to_num(v):
+    try:
+        return float(str(v).replace(",", "").replace("%", "").strip())
+    except (ValueError, TypeError):
+        return None
+
+
+def parse_json(text):
+    """Parse the model's JSON, tolerating code fences or extra words around it."""
+    text = text.strip()
+    try:
+        return json.loads(text)
+    except ValueError:
+        pass
+    a, b = text.find("{"), text.rfind("}")
+    if a != -1 and b > a:
+        return json.loads(text[a:b + 1])
+    raise ValueError("No JSON found")
+
+
+def normalize_spec(raw, forced_kind=None):
+    """Clean up the AI's chart data so it is always safe to draw."""
+    if not isinstance(raw, dict):
+        raise ValueError("Chart data was not an object")
+    kind = forced_kind or raw.get("chart_type")
+    if kind not in VALID_KINDS:
+        kind = "bar"
+
+    cats = list(raw.get("categories") or [])[:30]
+    series = []
+    for s_ in (raw.get("series") or [])[:5]:
+        if not isinstance(s_, dict):
+            continue
+        vals = [to_num(v) for v in (s_.get("values") or [])]
+        series.append({"name": str(s_.get("name") or "Value"), "values": vals})
+    series = [s_ for s_ in series if any(v is not None for v in s_["values"])]
+    if not series:
+        raise ValueError("No numbers to plot")
+
+    if kind != "histogram":
+        n = len(cats) if cats else max(len(s_["values"]) for s_ in series)
+        if not cats:
+            cats = [str(i + 1) for i in range(n)]
+        for s_ in series:  # shorter series get empty gaps instead of cutting data off
+            s_["values"] = (s_["values"] + [None] * n)[:n]
+        if kind == "scatter":
+            nums = [to_num(c) for c in cats]
+            cats = nums if all(v is not None for v in nums) else list(range(1, n + 1))
+        else:
+            cats = [str(c) for c in cats]
+
+    return {
+        "title": str(raw.get("title") or "Your graph"),
+        "chart_type": kind,
+        "x_label": str(raw.get("x_label") or ""),
+        "y_label": str(raw.get("y_label") or ""),
+        "categories": cats,
+        "series": series,
+        "summary": str(raw.get("summary") or ""),
+        "estimated": bool(raw.get("estimated")),
+    }
+
+
+def build_figure(spec):
+    kind, cats, series = spec["chart_type"], spec["categories"], spec["series"]
+    fig = go.Figure()
+    for i, s_ in enumerate(series):
+        color = PALETTE[i % len(PALETTE)]
+        if kind == "pie":
+            fig.add_trace(go.Pie(labels=cats, values=s_["values"], hole=0.35, name=s_["name"],
+                                 marker=dict(colors=PALETTE), textinfo="label+percent"))
+            break
+        if kind == "histogram":
+            fig.add_trace(go.Histogram(x=s_["values"], name=s_["name"], marker_color=color, opacity=0.85))
+        elif kind == "scatter":
+            fig.add_trace(go.Scatter(x=cats, y=s_["values"], name=s_["name"], mode="markers",
+                                     marker=dict(size=12, color=color, line=dict(width=1, color="white"))))
+        elif kind == "line":
+            fig.add_trace(go.Scatter(x=cats, y=s_["values"], name=s_["name"], mode="lines+markers",
+                                     line=dict(width=3, color=color), marker=dict(size=8)))
+        elif kind == "area":
+            fig.add_trace(go.Scatter(x=cats, y=s_["values"], name=s_["name"], mode="lines",
+                                     line=dict(width=2, color=color), fill="tozeroy"))
+        elif kind == "horizontal_bar":
+            fig.add_trace(go.Bar(x=s_["values"], y=cats, name=s_["name"], orientation="h", marker_color=color))
+        else:
+            fig.add_trace(go.Bar(x=cats, y=s_["values"], name=s_["name"], marker_color=color))
+
+    x_title, y_title = spec["x_label"], spec["y_label"]
+    if kind == "horizontal_bar":
+        x_title, y_title = y_title, x_title
+    fig.update_layout(
+        title=dict(text=spec["title"], font=dict(size=20)),
+        template="plotly_white", barmode="group", colorway=PALETTE,
+        font=dict(color="#2D2A4A"),
+        paper_bgcolor="rgba(255,255,255,0)", plot_bgcolor="rgba(255,255,255,0.6)",
+        xaxis_title=x_title, yaxis_title=y_title,
+        margin=dict(l=40, r=20, t=70, b=40), legend=dict(orientation="h", y=-0.2),
+    )
+    return fig
+
+
+def spec_to_frame(spec):
+    if spec["chart_type"] == "histogram":
+        return pd.DataFrame({s_["name"]: pd.Series(s_["values"]) for s_ in spec["series"]})
+    data = {"label": spec["categories"]}
+    for s_ in spec["series"]:
+        data[s_["name"]] = s_["values"]
+    return pd.DataFrame(data)
+
+
+def read_table(uploaded):
+    """Read a CSV or Excel upload into a small DataFrame (None, error on failure)."""
+    data = uploaded.getvalue()
+    if not data:
+        return None, "That file is empty."
+    if len(data) > MAX_FILE_MB * 1024 * 1024:
+        return None, f"That file is larger than {MAX_FILE_MB} MB."
+    try:
+        if uploaded.name.lower().endswith(".xlsx"):
+            df = pd.read_excel(io.BytesIO(data))
+        else:
+            df = pd.read_csv(io.BytesIO(data))
+    except Exception as e:
+        return None, f"Could not read that file: {e}"
+    if df.empty:
+        return None, "No rows found in that file."
+    return df.iloc[:200, :12], None
+
+
+# ----------------------------------------------------------------------------
 # Sidebar
 # ----------------------------------------------------------------------------
 with st.sidebar:
@@ -393,7 +572,7 @@ def get_client(key):
 
 
 client = get_client(api_key) if api_key else None
-tab_chat, tab_tools = st.tabs(["💬 Chat", "🛠️ Writing Tools"])
+tab_chat, tab_tools, tab_graph = st.tabs(["💬 Chat", "🛠️ Writing Tools", "📊 Graphs"])
 
 # ----------------------------------------------------------------------------
 # Chat tab
@@ -492,3 +671,81 @@ with tab_tools:
                     thinking=thinking_level,
                 )
                 st.markdown("</div>", unsafe_allow_html=True)
+
+
+# ----------------------------------------------------------------------------
+# Graphs tab
+# ----------------------------------------------------------------------------
+with tab_graph:
+    st.markdown("#### Turn any idea or information into a graph")
+    g_text = st.text_area(
+        "Describe your idea or paste your information",
+        height=150,
+        placeholder="e.g. Compare the monthly sales of 3 products: A 120, 150, 170 / B 90, 110, 95 / C 60, 80, 130 "
+                    "(Jan to Mar)\nor: Show how a student could split a 24-hour day.",
+    )
+    g_kind_name = st.selectbox("Chart type", list(CHART_TYPES.keys()))
+    with st.expander("📎 Or use a CSV / Excel file"):
+        g_file = st.file_uploader(f"Upload a CSV or Excel file (up to {MAX_FILE_MB} MB)",
+                                  type=["csv", "xlsx"], key="graph_file")
+
+    if st.button("📊 Create graph"):
+        if not client:
+            st.info("🔑 Add your Gemini API key in the sidebar to start.")
+        elif not g_text.strip() and not g_file:
+            st.warning("Please describe your idea, paste some information, or upload a file.")
+        else:
+            prompt_parts = [g_text.strip() or "Chart the most interesting insight in this data."]
+            problem = None
+            if g_file:
+                table, problem = read_table(g_file)
+                if problem is None:
+                    prompt_parts.append("Data (CSV):\n" + table.to_csv(index=False))
+            forced = CHART_TYPES[g_kind_name]
+            if forced:
+                prompt_parts.append(f"Use a {forced.replace('_', ' ')} chart.")
+
+            if problem:
+                st.warning(problem)
+            else:
+                box = st.empty()
+                box.markdown(pill("📊 Drawing your graph"), unsafe_allow_html=True)
+                try:
+                    raw_text = "".join(stream_gemini(
+                        client, [types.Part.from_text(text="\n\n".join(prompt_parts))],
+                        0.4, model_list, system=GRAPH_SYSTEM, thinking=thinking_level,
+                        on_wait=lambda msg: box.markdown(pill(msg), unsafe_allow_html=True),
+                        json_mode=True,
+                    ))
+                    st.session_state.graph = normalize_spec(parse_json(raw_text), forced)
+                    box.empty()
+                except FriendlyError as e:
+                    box.empty()
+                    st.warning(str(e))
+                    if e.detail:
+                        with st.expander("Technical details"):
+                            st.code(e.detail)
+                except (ValueError, KeyError, TypeError):
+                    box.empty()
+                    st.warning("I could not turn that into a graph. Try adding a few numbers or "
+                               "describing what you want to compare.")
+
+    spec = st.session_state.get("graph")
+    if spec:
+        st.plotly_chart(build_figure(spec), use_container_width=True)
+        if spec["summary"]:
+            st.markdown(f"💡 **{spec['summary']}**")
+        if spec["estimated"]:
+            st.caption("⚠️ These numbers are AI estimates, so treat them as an illustration, not facts.")
+        frame = spec_to_frame(spec)
+        with st.expander("🔢 See the data"):
+            st.dataframe(frame, use_container_width=True)
+        d1, d2 = st.columns(2)
+        with d1:
+            st.download_button("⬇️ Download data (CSV)", frame.to_csv(index=False),
+                               file_name="idea-spark-data.csv", mime="text/csv")
+        with d2:
+            st.download_button("⬇️ Download graph (HTML)",
+                               build_figure(spec).to_html(include_plotlyjs="cdn"),
+                               file_name="idea-spark-graph.html", mime="text/html")
+        st.caption("Tip: hover over the graph and click the camera icon to save it as a PNG image.")
