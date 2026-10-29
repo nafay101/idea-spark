@@ -5,6 +5,7 @@ A light, colorful AI assistant built with **Streamlit** and **Google Gemini Flas
 ## Features
 - 💬 **Chat**: streaming chatbot that remembers the conversation
 - 🛠️ **Writing Tools**: 23 tools (summarize, rewrite, fix grammar, quiz, flashcards, translate and more)
+- 📊 **Graphs**: describe an idea, paste data, or upload a CSV/Excel file and get an interactive chart (Plotly)
 - 📎 **File upload**: PDF, Word (.docx), TXT, MD, CSV, PNG, JPG (up to 15 MB)
 - 🔁 Automatic retry and backup models when Google is busy or rate-limited
 
