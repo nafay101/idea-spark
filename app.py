@@ -451,42 +451,301 @@ def normalize_spec(raw, forced_kind=None):
     }
 
 
+PLAN_SYSTEM = """You choose how to chart a table. You are given the column names, their types
+and the first rows. Reply with ONLY one valid JSON object (no markdown):
+{"title": str, "chart_type": "bar"|"horizontal_bar"|"line"|"area"|"pie"|"scatter"|"histogram",
+ "x_column": exact column name or null, "y_columns": [exact numeric column names, at most 5],
+ "x_label": str, "y_label": str, "aggregate": "none"|"sum"|"mean"|"count",
+ "sort": "none"|"asc"|"desc", "top_n": integer or null}
+Rules: use ONLY column names from the list, spelled exactly. Use the user's request to decide
+what to show. line/area suit time or ordered data, bar suits categories, pie suits shares of
+one total (one y column), scatter needs two numeric columns, histogram needs one numeric
+column and x_column null. If the x column repeats (for example several rows per region) use
+aggregate sum or mean. Use count to count rows per category when there is no number to plot."""
+
+
+def clean_number_text(series):
+    return (series.str.replace(r"^\((.*)\)$", r"-\1", regex=True)
+                  .str.replace(r"(?i)rs\.?|usd|[,$£€%\s]", "", regex=True))
+
+
+def numeric_clean(df):
+    """Turn text columns like '1,200' or '45%' into real numbers when most cells are numeric."""
+    out = df.copy()
+    for c in out.columns:
+        if not pd.api.types.is_numeric_dtype(out[c]) and not pd.api.types.is_datetime64_any_dtype(out[c]):
+            raw = out[c].astype(str).str.strip()
+            filled = ~raw.isin(["", "nan", "None", "NaN", "NaT"])
+            if not filled.any():
+                continue
+            nums = pd.to_numeric(clean_number_text(raw), errors="coerce")
+            if nums[filled].notna().mean() >= 0.8:
+                out[c] = nums
+    return out
+
+
+def frame_from_rows(rows):
+    """Build a DataFrame from rows of cell text (Word or PDF tables)."""
+    rows = [[("" if c is None else str(c).replace("\n", " ").strip()) for c in r] for r in rows if r]
+    rows = [r for r in rows if any(r)]
+    if len(rows) < 2:
+        return None
+    width = max(len(r) for r in rows)
+    rows = [r + [""] * (width - len(r)) for r in rows]
+    first = rows[0]
+    numeric_cells = sum(to_num(x) is not None for x in first)
+    if numeric_cells <= len(first) / 2:
+        header, body = first, rows[1:]
+    else:
+        header, body = [f"Column {i + 1}" for i in range(width)], rows
+    names, seen = [], {}
+    for i, h in enumerate(header):
+        h = h or f"Column {i + 1}"
+        seen[h] = seen.get(h, 0) + 1
+        names.append(h if seen[h] == 1 else f"{h} ({seen[h]})")
+    df = pd.DataFrame(body, columns=names)
+    df = df.loc[:, (df != "").any(axis=0)]
+    df = df[(df != "").any(axis=1)]
+    if df.empty:
+        return None
+    return numeric_clean(df.reset_index(drop=True))
+
+
+@st.cache_data(show_spinner=False, max_entries=20)
+def load_graph_file(name, data):
+    """Read any supported file. Returns tables found, plain text and an error (if any)."""
+    lower = name.lower()
+    result = {"tables": [], "text": "", "mime": None, "error": None}
+    try:
+        if lower.endswith(".csv"):
+            df = pd.read_csv(io.BytesIO(data))
+            result["tables"].append(("Data", numeric_clean(df.head(5000))))
+        elif lower.endswith(".xlsx"):
+            sheets = pd.read_excel(io.BytesIO(data), sheet_name=None)
+            for sheet, df in sheets.items():
+                df = df.dropna(how="all").dropna(axis=1, how="all")
+                if not df.empty:
+                    result["tables"].append((f"Sheet: {sheet}", numeric_clean(df.head(5000))))
+        elif lower.endswith(".docx"):
+            from docx import Document
+
+            doc = Document(io.BytesIO(data))
+            for i, table in enumerate(doc.tables, 1):
+                df = frame_from_rows([[c.text for c in r.cells] for r in table.rows])
+                if df is not None:
+                    result["tables"].append((f"Word table {i}", df))
+            result["text"] = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+        elif lower.endswith(".pdf"):
+            result["mime"] = "application/pdf"
+            try:
+                import pdfplumber
+
+                texts, count = [], 0
+                with pdfplumber.open(io.BytesIO(data)) as pdf:
+                    for page_no, page in enumerate(pdf.pages[:30], 1):
+                        for table in page.extract_tables():
+                            df = frame_from_rows(table)
+                            if df is not None:
+                                count += 1
+                                result["tables"].append((f"PDF table {count} (page {page_no})", df))
+                        texts.append(page.extract_text() or "")
+                result["text"] = "\n".join(texts)
+            except ImportError:
+                pass
+        elif lower.endswith((".txt", ".md")):
+            result["text"] = data.decode("utf-8", errors="ignore")
+        elif lower.endswith((".png", ".jpg", ".jpeg")):
+            result["mime"] = "image/png" if lower.endswith(".png") else "image/jpeg"
+        else:
+            result["error"] = "That file type is not supported."
+    except Exception as e:
+        result["error"] = f"Could not read that file: {e}"
+    return result
+
+
+def table_brief(df):
+    lines = [f"Rows: {len(df)}", "Columns:"]
+    for c in df.columns:
+        kind = "number" if pd.api.types.is_numeric_dtype(df[c]) else "text"
+        lines.append(f"- {c} ({kind})")
+    lines.append("First rows (CSV):")
+    lines.append(df.head(25).to_csv(index=False))
+    return "\n".join(lines)
+
+
+def plan_to_spec(df, plan, forced=None):
+    """Build chart data from the REAL table, so every number is exact."""
+    df = df.copy()
+    df.columns = [str(c) for c in df.columns]
+    lookup = {c.strip().lower(): c for c in df.columns}
+
+    def find(name):
+        return lookup.get(str(name).strip().lower()) if name not in (None, "") else None
+
+    num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    x = find(plan.get("x_column"))
+    ys = []
+    for n in plan.get("y_columns") or []:
+        c = find(n)
+        if c and c != x and c in num_cols and c not in ys:
+            ys.append(c)
+    ys = ys[:5]
+    kind = forced or plan.get("chart_type")
+    if kind not in VALID_KINDS:
+        kind = "bar"
+    agg = plan.get("aggregate") if plan.get("aggregate") in ("sum", "mean", "count") else "none"
+    sort = plan.get("sort") if plan.get("sort") in ("asc", "desc") else "none"
+    try:
+        top_n = int(plan.get("top_n")) if plan.get("top_n") else None
+    except (ValueError, TypeError):
+        top_n = None
+
+    if x is None and kind != "histogram":
+        text_cols = [c for c in df.columns if c not in num_cols]
+        x = text_cols[0] if text_cols else None
+    if not ys:
+        ys = [c for c in num_cols if c != x][:3]
+
+    spec = {"chart_type": kind, "summary": "", "estimated": False, "note": "", "source": "table"}
+
+    if kind == "histogram":
+        if not ys:
+            raise ValueError("No numeric column to plot")
+        col = ys[0]
+        vals = [float(v) for v in df[col].dropna()]
+        spec.update(title=str(plan.get("title") or f"Distribution of {col}"),
+                    x_label=str(plan.get("x_label") or col), y_label="Count", categories=[],
+                    series=[{"name": col, "values": vals}])
+        return spec
+
+    if not ys and agg != "count":
+        raise ValueError("No numeric columns to plot")
+
+    if x is None:
+        work = df[ys].copy()
+        work.insert(0, "Row", range(1, len(work) + 1))
+        x = "Row"
+    else:
+        work = df[[x] + ys].copy()
+    if pd.api.types.is_datetime64_any_dtype(work[x]):
+        work[x] = work[x].dt.strftime("%Y-%m-%d")
+
+    if agg == "count" or not ys:
+        g = work.groupby(x, sort=False).size().reset_index(name="Count")
+        ys = ["Count"]
+    elif agg in ("sum", "mean"):
+        g = work.groupby(x, sort=False)[ys].agg(agg).reset_index()
+    else:
+        g = work.dropna(subset=ys, how="all")
+
+    if top_n and sort == "none":
+        sort = "desc"
+    if sort != "none":
+        g = g.sort_values(ys[0], ascending=(sort == "asc"), kind="stable")
+    if top_n:
+        g = g.head(top_n)
+    limit = 400 if kind in ("line", "area", "scatter") else 40
+    if len(g) > limit:
+        spec["note"] = f"Showing the first {limit} of {len(g)} rows to keep the graph readable."
+        g = g.head(limit)
+
+    if kind == "scatter" and pd.api.types.is_numeric_dtype(g[x]):
+        cats = [float(v) for v in g[x]]
+    elif kind == "scatter":
+        cats = list(range(1, len(g) + 1))
+    else:
+        cats = [str(v) for v in g[x]]
+    series = [{"name": c, "values": [None if pd.isna(v) else float(v) for v in g[c]]} for c in ys]
+    spec.update(
+        title=str(plan.get("title") or f"{', '.join(ys)} by {x}"),
+        x_label=str(plan.get("x_label") or x),
+        y_label=str(plan.get("y_label") or (ys[0] if len(ys) == 1 else "")),
+        categories=cats, series=series,
+    )
+    return spec
+
+
+def fmt_num(v):
+    return f"{v:,.2f}".rstrip("0").rstrip(".")
+
+
+def quick_facts(spec):
+    """Simple facts worked out by the app itself (never by the AI), so they are exact."""
+    first = spec["series"][0]
+    kind = spec["chart_type"]
+    if kind == "histogram":
+        vals = [v for v in first["values"] if v is not None]
+        if not vals:
+            return ""
+        return (f"📌 **Count:** {len(vals)} · **Lowest:** {fmt_num(min(vals))} · "
+                f"**Highest:** {fmt_num(max(vals))} · **Average:** {fmt_num(sum(vals) / len(vals))}")
+    pairs = [(c, v) for c, v in zip(spec["categories"], first["values"]) if v is not None]
+    if not pairs:
+        return ""
+    hi = max(pairs, key=lambda p: p[1])
+    lo = min(pairs, key=lambda p: p[1])
+    total = sum(v for _, v in pairs)
+    who = f" ({first['name']})" if len(spec["series"]) > 1 else ""
+    if kind == "scatter":
+        return (f"📌 **Points:** {len(pairs)} · **Lowest{who}:** {fmt_num(lo[1])} · "
+                f"**Highest{who}:** {fmt_num(hi[1])}")
+    return (f"📌 **Highest{who}:** {hi[0]} ({fmt_num(hi[1])}) · **Lowest:** {lo[0]} ({fmt_num(lo[1])}) · "
+            f"**Total:** {fmt_num(total)} · **Average:** {fmt_num(total / len(pairs))}")
+
+
 def build_figure(spec):
     kind, cats, series = spec["chart_type"], spec["categories"], spec["series"]
+    many = len(cats) > 12
     fig = go.Figure()
     for i, s_ in enumerate(series):
         color = PALETTE[i % len(PALETTE)]
+        vals = s_["values"]
         if kind == "pie":
-            fig.add_trace(go.Pie(labels=cats, values=s_["values"], hole=0.35, name=s_["name"],
-                                 marker=dict(colors=PALETTE), textinfo="label+percent"))
+            fig.add_trace(go.Pie(labels=cats, values=vals, hole=0.4, name=s_["name"], sort=False,
+                                 marker=dict(colors=PALETTE * 6, line=dict(color="white", width=2)),
+                                 textinfo="label+percent"))
             break
         if kind == "histogram":
-            fig.add_trace(go.Histogram(x=s_["values"], name=s_["name"], marker_color=color, opacity=0.85))
+            fig.add_trace(go.Histogram(x=vals, name=s_["name"], opacity=0.9,
+                                       marker=dict(color=color, line=dict(color="white", width=1))))
         elif kind == "scatter":
-            fig.add_trace(go.Scatter(x=cats, y=s_["values"], name=s_["name"], mode="markers",
-                                     marker=dict(size=12, color=color, line=dict(width=1, color="white"))))
+            fig.add_trace(go.Scatter(x=cats, y=vals, name=s_["name"], mode="markers",
+                                     marker=dict(size=12, color=color, line=dict(width=1.5, color="white"))))
         elif kind == "line":
-            fig.add_trace(go.Scatter(x=cats, y=s_["values"], name=s_["name"], mode="lines+markers",
+            fig.add_trace(go.Scatter(x=cats, y=vals, name=s_["name"],
+                                     mode="lines" if len(cats) > 40 else "lines+markers",
                                      line=dict(width=3, color=color), marker=dict(size=8)))
         elif kind == "area":
-            fig.add_trace(go.Scatter(x=cats, y=s_["values"], name=s_["name"], mode="lines",
+            fig.add_trace(go.Scatter(x=cats, y=vals, name=s_["name"], mode="lines",
                                      line=dict(width=2, color=color), fill="tozeroy"))
         elif kind == "horizontal_bar":
-            fig.add_trace(go.Bar(x=s_["values"], y=cats, name=s_["name"], orientation="h", marker_color=color))
+            extra = {} if many else dict(texttemplate="%{x:,.4~g}", textposition="outside", cliponaxis=False)
+            fig.add_trace(go.Bar(x=vals, y=cats, name=s_["name"], orientation="h",
+                                 marker=dict(color=color), **extra))
         else:
-            fig.add_trace(go.Bar(x=cats, y=s_["values"], name=s_["name"], marker_color=color))
+            extra = {} if many else dict(texttemplate="%{y:,.4~g}", textposition="outside", cliponaxis=False)
+            fig.add_trace(go.Bar(x=cats, y=vals, name=s_["name"], marker=dict(color=color), **extra))
 
     x_title, y_title = spec["x_label"], spec["y_label"]
     if kind == "horizontal_bar":
         x_title, y_title = y_title, x_title
     fig.update_layout(
-        title=dict(text=spec["title"], font=dict(size=20)),
+        title=dict(text=spec["title"], x=0.01, xanchor="left", font=dict(size=22, color="#2D2A4A")),
         template="plotly_white", barmode="group", colorway=PALETTE,
-        font=dict(color="#2D2A4A"),
-        paper_bgcolor="rgba(255,255,255,0)", plot_bgcolor="rgba(255,255,255,0.6)",
-        xaxis_title=x_title, yaxis_title=y_title,
-        margin=dict(l=40, r=20, t=70, b=40), legend=dict(orientation="h", y=-0.2),
+        font=dict(family="Segoe UI, Inter, sans-serif", color="#2D2A4A", size=13),
+        paper_bgcolor="rgba(255,255,255,0)", plot_bgcolor="rgba(255,255,255,0.7)",
+        height=480, margin=dict(l=50, r=30, t=80, b=60),
+        showlegend=(len(series) > 1 or kind == "pie"),
+        legend=dict(orientation="h", y=-0.22, x=0),
+        hoverlabel=dict(bgcolor="white", font_size=13),
     )
+    if kind in ("line", "area"):
+        fig.update_layout(hovermode="x unified")
+    if kind != "pie":
+        fig.update_xaxes(title_text=x_title, gridcolor="#EEE9FF", zeroline=False, automargin=True)
+        fig.update_yaxes(title_text=y_title, gridcolor="#EEE9FF", zeroline=False, automargin=True)
+        if many and kind in ("bar", "line", "area"):
+            fig.update_xaxes(tickangle=-35)
     return fig
 
 
@@ -497,25 +756,6 @@ def spec_to_frame(spec):
     for s_ in spec["series"]:
         data[s_["name"]] = s_["values"]
     return pd.DataFrame(data)
-
-
-def read_table(uploaded):
-    """Read a CSV or Excel upload into a small DataFrame (None, error on failure)."""
-    data = uploaded.getvalue()
-    if not data:
-        return None, "That file is empty."
-    if len(data) > MAX_FILE_MB * 1024 * 1024:
-        return None, f"That file is larger than {MAX_FILE_MB} MB."
-    try:
-        if uploaded.name.lower().endswith(".xlsx"):
-            df = pd.read_excel(io.BytesIO(data))
-        else:
-            df = pd.read_csv(io.BytesIO(data))
-    except Exception as e:
-        return None, f"Could not read that file: {e}"
-    if df.empty:
-        return None, "No rows found in that file."
-    return df.iloc[:200, :12], None
 
 
 # ----------------------------------------------------------------------------
@@ -677,68 +917,129 @@ with tab_tools:
 # Graphs tab
 # ----------------------------------------------------------------------------
 with tab_graph:
-    st.markdown("#### Turn any idea or information into a graph")
-    g_text = st.text_area(
-        "Describe your idea or paste your information",
-        height=150,
-        placeholder="e.g. Compare the monthly sales of 3 products: A 120, 150, 170 / B 90, 110, 95 / C 60, 80, 130 "
-                    "(Jan to Mar)\nor: Show how a student could split a 24-hour day.",
-    )
+    st.markdown("#### Turn your data into clear, accurate graphs")
+    st.caption("Upload Excel, CSV, Word, PDF or an image, or just describe an idea. "
+               "Tables inside your files are charted with their exact numbers.")
+    g_source = st.radio("Where is your data?", ["📎 Upload a file", "✍️ Type an idea or paste data"],
+                        horizontal=True, label_visibility="collapsed")
+
+    g_file, g_text, raw_bytes = None, "", b""
+    if g_source.startswith("📎"):
+        g_file = st.file_uploader(
+            f"Upload a file (up to {MAX_FILE_MB} MB)",
+            type=["xlsx", "csv", "docx", "pdf", "txt", "md", "png", "jpg", "jpeg"], key="graph_file",
+        )
+        g_text = st.text_input("What should the graph show? (optional)",
+                               placeholder="e.g. sales by region, or compare 2023 with 2024")
+    else:
+        g_text = st.text_area(
+            "Describe your idea or paste your information", height=150,
+            placeholder="e.g. Compare monthly sales: Product A 120, 150, 170 / Product B 90, 110, 95 "
+                        "(Jan to Mar)\nor: Show how a student could split a 24-hour day.",
+        )
     g_kind_name = st.selectbox("Chart type", list(CHART_TYPES.keys()))
-    with st.expander("📎 Or use a CSV / Excel file"):
-        g_file = st.file_uploader(f"Upload a CSV or Excel file (up to {MAX_FILE_MB} MB)",
-                                  type=["csv", "xlsx"], key="graph_file")
+
+    source, table_df, file_problem = None, None, None
+    if g_file:
+        raw_bytes = g_file.getvalue()
+        if not raw_bytes:
+            file_problem = "That file is empty."
+        elif len(raw_bytes) > MAX_FILE_MB * 1024 * 1024:
+            file_problem = f"That file is larger than {MAX_FILE_MB} MB."
+        else:
+            source = load_graph_file(g_file.name, raw_bytes)
+            file_problem = source["error"]
+        if file_problem:
+            st.warning(file_problem)
+        elif source["tables"]:
+            labels = [f"{label} ({len(df)} rows × {len(df.columns)} columns)"
+                      for label, df in source["tables"]]
+            pick = 0
+            if len(labels) > 1:
+                pick = labels.index(st.selectbox("Which table should I chart?", labels, key="graph_table"))
+            table_df = source["tables"][pick][1]
+            with st.expander("👀 Preview of the table I found"):
+                st.dataframe(table_df.head(50), use_container_width=True)
+        else:
+            st.info("I did not find a table in this file, so AI will read the numbers from its content. "
+                    "Please check the result against your original.")
 
     if st.button("📊 Create graph"):
+        forced = CHART_TYPES[g_kind_name]
         if not client:
             st.info("🔑 Add your Gemini API key in the sidebar to start.")
-        elif not g_text.strip() and not g_file:
-            st.warning("Please describe your idea, paste some information, or upload a file.")
+        elif not g_file and not g_text.strip():
+            st.warning("Please upload a file or describe your idea first.")
+        elif file_problem:
+            st.warning("Please fix the file problem above first.")
         else:
-            prompt_parts = [g_text.strip() or "Chart the most interesting insight in this data."]
-            problem = None
-            if g_file:
-                table, problem = read_table(g_file)
-                if problem is None:
-                    prompt_parts.append("Data (CSV):\n" + table.to_csv(index=False))
-            forced = CHART_TYPES[g_kind_name]
-            if forced:
-                prompt_parts.append(f"Use a {forced.replace('_', ' ')} chart.")
+            box = st.empty()
+            box.markdown(pill("📊 Drawing your graph"), unsafe_allow_html=True)
 
-            if problem:
-                st.warning(problem)
-            else:
-                box = st.empty()
-                box.markdown(pill("📊 Drawing your graph"), unsafe_allow_html=True)
-                try:
-                    raw_text = "".join(stream_gemini(
-                        client, [types.Part.from_text(text="\n\n".join(prompt_parts))],
-                        0.4, model_list, system=GRAPH_SYSTEM, thinking=thinking_level,
-                        on_wait=lambda msg: box.markdown(pill(msg), unsafe_allow_html=True),
-                        json_mode=True,
-                    ))
-                    st.session_state.graph = normalize_spec(parse_json(raw_text), forced)
-                    box.empty()
-                except FriendlyError as e:
-                    box.empty()
-                    st.warning(str(e))
-                    if e.detail:
-                        with st.expander("Technical details"):
-                            st.code(e.detail)
-                except (ValueError, KeyError, TypeError):
-                    box.empty()
-                    st.warning("I could not turn that into a graph. Try adding a few numbers or "
-                               "describing what you want to compare.")
+            def wait_msg(msg):
+                box.markdown(pill(msg), unsafe_allow_html=True)
+
+            hint = f"\nUse a {forced.replace('_', ' ')} chart." if forced else ""
+            request = g_text.strip() or "Choose the most useful chart for this data."
+            try:
+                if table_df is not None:
+                    # Exact path: the AI only picks WHAT to chart, the app reads the real numbers.
+                    prompt = f"User request: {request}{hint}\n\n{table_brief(table_df)}"
+                    plan, ai_note = {}, ""
+                    try:
+                        text = "".join(stream_gemini(
+                            client, [types.Part.from_text(text=prompt)], 0.2, model_list,
+                            system=PLAN_SYSTEM, thinking=thinking_level, on_wait=wait_msg, json_mode=True))
+                        plan = parse_json(text)
+                    except (FriendlyError, ValueError):
+                        ai_note = "AI was busy, so a simple chart was chosen automatically. Try again for a smarter one."
+                    spec = plan_to_spec(table_df, plan if isinstance(plan, dict) else {}, forced)
+                    if ai_note:
+                        spec["note"] = (spec["note"] + " " + ai_note).strip()
+                else:
+                    # Reading path: AI reads numbers from text, a PDF or an image.
+                    parts = [types.Part.from_text(text=f"{request}{hint}")]
+                    if source and source["text"]:
+                        parts.append(types.Part.from_text(text="Document text:\n" + source["text"][:30000]))
+                    if source and source["mime"] and not source["tables"]:
+                        parts.append(types.Part.from_bytes(data=raw_bytes, mime_type=source["mime"]))
+                    text = "".join(stream_gemini(
+                        client, parts, 0.3, model_list, system=GRAPH_SYSTEM, thinking=thinking_level,
+                        on_wait=wait_msg, json_mode=True))
+                    spec = normalize_spec(parse_json(text), forced)
+                    spec["source"] = "ai"
+                st.session_state.graph = spec
+                box.empty()
+            except FriendlyError as e:
+                box.empty()
+                st.warning(str(e))
+                if e.detail:
+                    with st.expander("Technical details"):
+                        st.code(e.detail)
+            except (ValueError, KeyError, TypeError, AttributeError):
+                box.empty()
+                st.warning("I could not turn that into a graph. Check that your data has some numbers, "
+                           "or tell me what you want to compare.")
 
     spec = st.session_state.get("graph")
     if spec:
-        st.plotly_chart(build_figure(spec), use_container_width=True)
-        if spec["summary"]:
-            st.markdown(f"💡 **{spec['summary']}**")
-        if spec["estimated"]:
-            st.caption("⚠️ These numbers are AI estimates, so treat them as an illustration, not facts.")
+        st.plotly_chart(build_figure(spec), use_container_width=True,
+                        config={"displaylogo": False,
+                                "toImageButtonOptions": {"format": "png", "scale": 3,
+                                                         "filename": "idea-spark-graph"}})
+        facts = quick_facts(spec)
+        if facts:
+            st.markdown(facts)
+        if spec.get("source") == "table":
+            st.caption("✅ Every value in this graph comes straight from your table.")
+        else:
+            st.caption("⚠️ AI read these numbers from your text or document"
+                       + (" and some are estimates" if spec.get("estimated") else "")
+                       + ". Please compare them with your original in the data table below.")
+        if spec.get("note"):
+            st.caption("ℹ️ " + spec["note"])
         frame = spec_to_frame(spec)
-        with st.expander("🔢 See the data"):
+        with st.expander("🔢 See the data used in this graph"):
             st.dataframe(frame, use_container_width=True)
         d1, d2 = st.columns(2)
         with d1:
@@ -748,4 +1049,4 @@ with tab_graph:
             st.download_button("⬇️ Download graph (HTML)",
                                build_figure(spec).to_html(include_plotlyjs="cdn"),
                                file_name="idea-spark-graph.html", mime="text/html")
-        st.caption("Tip: hover over the graph and click the camera icon to save it as a PNG image.")
+        st.caption("Tip: hover over the graph and click the camera icon to save a sharp PNG image.")
